@@ -1,0 +1,298 @@
+package com.christophe.research;
+
+import android.os.Binder;
+import android.os.IBinder;
+import android.os.Parcel;
+import java.lang.reflect.*;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+public final class McuReadProbe {
+    static Object connection;
+    static final LinkedBlockingQueue<byte[]> replies = new LinkedBlockingQueue<>();
+    static String listenerDescriptor() {
+        for(String name:new String[]{"android.app.wear.IDataChangeListener", "android.app.wear.IDataChangeListener$Stub"})try {
+            Class<?> c=Class.forName(name);
+            for(Field f:c.getDeclaredFields())if(f.getType()==String.class && f.getName().contains("DESCRIPTOR")) {
+                f.setAccessible(true);return (String)f.get(null);
+            }
+        } catch(Exception ignored) {}
+        return "android.app.wear.IDataChangeListener";
+    }
+    static final class Listener extends Binder {
+        Listener() { attachInterface(null, listenerDescriptor()); System.out.println("LISTENER_DESCRIPTOR "+listenerDescriptor()); }
+        public boolean onTransact(int code, Parcel in, Parcel out, int flags) {
+            if (code == INTERFACE_TRANSACTION) {
+                if (out != null) out.writeString(listenerDescriptor());
+                return true;
+            }
+            try {
+                in.enforceInterface(listenerDescriptor());
+                int type=in.readInt();
+                if (in.dataAvail() > 0 && in.readInt() != 0) {
+                    Class<?> cls=Class.forName("android.app.wear.McuData");
+                    Object value=cls.getMethod("readFromParcel",Parcel.class).invoke(null,in);
+                    for (Field f:cls.getDeclaredFields()) {
+                        if (f.getType()==byte[].class) {
+                            f.setAccessible(true); byte[] bytes=(byte[])f.get(value);
+                            if(bytes!=null) {
+                                replies.offer(bytes);
+                            }
+                        }
+                    }
+                }
+                if(out!=null)out.writeNoException();
+                return true;
+            } catch(Throwable e) { e.printStackTrace(); return false; }
+        }
+    }
+    static Object call(Object target,String name,Class<?>[] types,Object... args)throws Exception {
+        Method m=target.getClass().getMethod(name,types);m.setAccessible(true);
+        return m.invoke(target,args);
+    }
+    static byte[] adbPacket(String cmd,int arg0,int arg1,byte[] payload) {
+        byte[] c=cmd.getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        int command=ByteBuffer.wrap(c).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        int sum=0;for(byte b:payload)sum+=b&255;
+        ByteBuffer bb=ByteBuffer.allocate(24+payload.length).order(ByteOrder.LITTLE_ENDIAN);
+        bb.putInt(command).putInt(arg0).putInt(arg1).putInt(payload.length).putInt(sum).putInt(command^0xffffffff).put(payload);
+        return bb.array();
+    }
+    static byte[] streamBuffer=new byte[0];
+    static byte[] readBytes(int count,long deadline)throws Exception {
+        while(streamBuffer.length<count) {
+            long remain=deadline-System.currentTimeMillis();
+            if(remain<=0)throw new java.io.IOException("MCU response timeout");
+            byte[] part=replies.poll(remain,TimeUnit.MILLISECONDS);
+            if(part==null)throw new java.io.IOException("MCU response timeout");
+            byte[] joined=Arrays.copyOf(streamBuffer,streamBuffer.length+part.length);
+            System.arraycopy(part,0,joined,streamBuffer.length,part.length);streamBuffer=joined;
+        }
+        byte[] answer=Arrays.copyOf(streamBuffer,count);
+        streamBuffer=Arrays.copyOfRange(streamBuffer,count,streamBuffer.length);return answer;
+    }
+    static void sendAdb(String command,int a,int b,byte[] payload)throws Exception {
+        boolean ok=(Boolean)call(connection,"send",new Class[]{int.class,byte[].class},0x1201,adbPacket(command,a,b,payload));
+        System.out.println("ADB_SEND "+command+" "+ok);
+        if(!ok)throw new java.io.IOException("MCU transport refused "+command);
+    }
+    static Object[] readAdb(long deadline)throws Exception {
+        byte[] head=readBytes(24,deadline);
+        ByteBuffer bb=ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN);
+        int cmd=bb.getInt(),a=bb.getInt(),b=bb.getInt(),len=bb.getInt(),crc=bb.getInt(),magic=bb.getInt();
+        if(magic!=(cmd^0xffffffff)||len<0||len>65536)throw new java.io.IOException("Bad ADB response header");
+        String command=new String(head,0,4,"US-ASCII");
+        byte[] payload=readBytes(len,deadline);
+        System.out.println("ADB_RECEIVE "+command+" a="+a+" b="+b+" len="+len);
+        return new Object[]{command,a,b,payload};
+    }
+    static int nextLocal=20;
+    static final String AOD_PATH="@@NATIVE_PATH@@";
+    static final String ORIGINAL_SHA="@@ORIGINAL_SHA@@";
+    static final String CANDIDATE_SHA="@@CANDIDATE_SHA@@";
+    static String sha(byte[] bytes)throws Exception {
+        byte[] digest=java.security.MessageDigest.getInstance("SHA-256").digest(bytes);
+        StringBuilder result=new StringBuilder();for(byte b:digest)result.append(String.format("%02x",b&255));return result.toString();
+    }
+    static byte[] syncMessage(String tag,int value,byte[] body)throws Exception {
+        return ByteBuffer.allocate(8+body.length).order(ByteOrder.LITTLE_ENDIAN).put(tag.getBytes("US-ASCII")).putInt(value).put(body).array();
+    }
+    static int[] openSync(long deadline)throws Exception {
+        int local=nextLocal++;
+        sendAdb("OPEN",local,0,"sync:\0".getBytes("UTF-8"));
+        while(true) {
+            Object[] p=readAdb(deadline);
+            if((Integer)p[2]!=local)continue;
+            if(!p[0].equals("OKAY"))throw new java.io.IOException("Sync open failed: "+p[0]);
+            return new int[]{local,(Integer)p[1]};
+        }
+    }
+    static void sendSync(int[] channel,byte[] body,long deadline,java.io.ByteArrayOutputStream response)throws Exception {
+        sendAdb("WRTE",channel[0],channel[1],body);
+        while(true) {
+            Object[] p=readAdb(deadline);if((Integer)p[2]!=channel[0])continue;
+            if(p[0].equals("OKAY"))return;
+            if(p[0].equals("WRTE")) {
+                response.write((byte[])p[3]);sendAdb("OKAY",channel[0],channel[1],new byte[0]);
+            } else if(p[0].equals("CLSE"))throw new java.io.IOException("Sync channel closed");
+        }
+    }
+    static void receiveSync(int[] channel,long deadline,java.io.ByteArrayOutputStream response)throws Exception {
+        while(true) {
+            Object[] p=readAdb(deadline);if((Integer)p[2]!=channel[0])continue;
+            if(p[0].equals("WRTE")) {
+                response.write((byte[])p[3]);sendAdb("OKAY",channel[0],channel[1],new byte[0]);return;
+            }
+            if(p[0].equals("CLSE"))throw new java.io.IOException("Sync channel closed before response");
+        }
+    }
+    static byte[] readNativeAod()throws Exception {
+        long deadline=System.currentTimeMillis()+20000;int[] c=openSync(deadline);
+        java.io.ByteArrayOutputStream response=new java.io.ByteArrayOutputStream(),file=new java.io.ByteArrayOutputStream();
+        byte[] path=AOD_PATH.getBytes("UTF-8");sendSync(c,syncMessage("RECV",path.length,path),deadline,response);
+        int pos=0;
+        while(true) {
+            byte[] data=response.toByteArray();
+            if(pos+8>data.length){receiveSync(c,deadline,response);continue;}
+            String tag=new String(data,pos,4,"US-ASCII");int len=ByteBuffer.wrap(data,pos+4,4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+            if(tag.equals("DONE")){sendAdb("CLSE",c[0],c[1],new byte[0]);return file.toByteArray();}
+            if(len<0||len>1048576)throw new java.io.IOException("Bad sync length");
+            if(pos+8+len>data.length){receiveSync(c,deadline,response);continue;}
+            if(tag.equals("FAIL"))throw new java.io.IOException("Read refused: "+new String(data,pos+8,len,"UTF-8"));
+            if(!tag.equals("DATA"))throw new java.io.IOException("Bad read tag "+tag);
+            file.write(data,pos+8,len);pos+=8+len;
+        }
+    }
+    static void writeNativeAod(byte[] body)throws Exception {
+        long deadline=System.currentTimeMillis()+30000;int[] c=openSync(deadline);
+        java.io.ByteArrayOutputStream response=new java.io.ByteArrayOutputStream();
+        byte[] path=(AOD_PATH+",33188").getBytes("UTF-8");
+        sendSync(c,syncMessage("SEND",path.length,path),deadline,response);
+        for(int pos=0;pos<body.length;pos+=1024) {
+            byte[] part=Arrays.copyOfRange(body,pos,Math.min(body.length,pos+1024));
+            sendSync(c,syncMessage("DATA",part.length,part),deadline,response);
+        }
+        sendSync(c,syncMessage("DONE",(int)(System.currentTimeMillis()/1000),new byte[0]),deadline,response);
+        while(response.size()<8)receiveSync(c,deadline,response);
+        byte[] result=response.toByteArray();String tag=new String(result,0,4,"US-ASCII");
+        int len=ByteBuffer.wrap(result,4,4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        if(!tag.equals("OKAY")) {
+            if(len>=0&&len<65536)while(response.size()<8+len)receiveSync(c,deadline,response);
+            throw new java.io.IOException("Write refused: "+new String(response.toByteArray(),"UTF-8"));
+        }
+        sendAdb("CLSE",c[0],c[1],new byte[0]);
+        System.out.println("MCU_WRITE_ACCEPTED bytes="+body.length);
+    }
+    static void guardedAodUpdate(boolean restore)throws Exception {
+        byte[] original=java.nio.file.Files.readAllBytes(java.nio.file.Paths.get("/data/local/tmp/oneplus-rtos-watchface/aod-main-original.js"));
+        byte[] candidate=java.nio.file.Files.readAllBytes(java.nio.file.Paths.get("/data/local/tmp/oneplus-rtos-watchface/aod-main-candidate.js"));
+        if(!sha(original).equals(ORIGINAL_SHA)||!sha(candidate).equals(CANDIDATE_SHA))throw new java.io.IOException("Local inputs hash mismatch");
+        byte[] before=readNativeAod();String beforeSha=sha(before);
+        System.out.println("MCU_PREFLIGHT_SHA256 "+beforeSha);
+        if(!beforeSha.equals(ORIGINAL_SHA)&&!beforeSha.equals(CANDIDATE_SHA))throw new java.io.IOException("Unexpected native file, no overwrite");
+        byte[] target=restore?original:candidate;
+        if(Arrays.equals(before,target)){System.out.println("MCU_AOD_ALREADY_VERIFIED "+sha(target));return;}
+        try {
+            writeNativeAod(target);
+            byte[] after=readNativeAod();
+            if(!Arrays.equals(after,target))throw new java.io.IOException("Native readback mismatch");
+            System.out.println("MCU_AOD_VERIFIED_SHA256 "+sha(after));
+            System.out.println("MCU_AOD_VERIFIED_BYTES "+after.length);
+        } catch(Exception error) {
+            System.out.println("MCU_UPDATE_FAILED "+error);
+            try {
+                writeNativeAod(before);
+                if(!Arrays.equals(readNativeAod(),before))throw new java.io.IOException("Restore readback mismatch");
+                System.out.println("MCU_ROLLBACK_VERIFIED "+beforeSha);
+            } catch(Exception rollback) {System.out.println("MCU_ROLLBACK_FAILED "+rollback);}
+            throw error;
+        }
+    }
+    public static void main(String[] args)throws Exception {
+        if(args.length==0||args[0].equals("inspect")) for(String n:new String[]{"android.app.wear.IMcuManager","android.app.wear.IDataEventConnection","android.app.wear.McuData","android.app.wear.MessageType"}) {
+            Class<?> c=Class.forName(n);
+            System.out.println("API "+n);
+            for(Constructor<?> ct:c.getDeclaredConstructors())System.out.println(ct);
+            for(Method m:c.getDeclaredMethods())System.out.println(m);
+        }
+        Class<?> mt=Class.forName("android.app.wear.MessageType");
+        for(int sample:new int[]{0x1201,0x4001,0x02001201}) {
+            Object value=mt.getConstructor().newInstance();
+            Method setter=mt.getDeclaredMethod("setType",int.class);setter.setAccessible(true);
+            System.out.println("MESSAGE_ENCODING "+sample+" valid="+setter.invoke(value,sample)+" version="+mt.getMethod("getMessageTypeVersion",int.class).invoke(null,sample));
+        }
+        for(Constructor<?> ct:mt.getDeclaredConstructors()) {
+            if(Arrays.equals(ct.getParameterTypes(),new Class[]{int.class,int.class})) {
+                ct.setAccessible(true);Object value=ct.newInstance(18,1);
+                System.out.println("TYPE_18_1 "+call(value,"getType",new Class[]{}));
+            }
+        }
+        if(args.length==0||args[0].equals("inspect"))return;
+        if(!Arrays.asList("shell-read","adb-handshake","adb-list","adb-pull","adb-install-aod","adb-restore-aod").contains(args[0]))throw new IllegalArgumentException("Unsupported probe mode");
+        IBinder service=(IBinder)Class.forName("android.os.ServiceManager").getMethod("getService",String.class).invoke(null,"mcu");
+        Object manager=Class.forName("android.app.wear.IMcuManager$Stub").getMethod("asInterface",IBinder.class).invoke(null,service);
+        Listener listener=new Listener();
+        IBinder connectionBinder=(IBinder)call(manager,"createDataEventConnection",new Class[]{String.class,IBinder.class},"com.android.shell",listener);
+        connection=Class.forName("android.app.wear.IDataEventConnection$Stub").getMethod("asInterface",IBinder.class).invoke(null,connectionBinder);
+        System.out.println("CONNECTION "+connection);
+        try {
+            int classId=args[0].equals("shell-read")?64:18;
+            System.out.println("REGISTER "+call(connection,"addMessageClassId",new Class[]{int.class,int.class},classId,0));
+            int msg=(classId<<8)|1;
+            System.out.println("BIND "+call(connection,"addMessageType",new Class[]{int.class,int.class},msg,2));
+            if(args[0].equals("shell-read")) {
+                System.out.println("SEND "+call(connection,"send",new Class[]{int.class,byte[].class},msg,"pwd".getBytes("UTF-8")));
+                Thread.sleep(6000);
+            } else {
+                long deadline=System.currentTimeMillis()+12000;
+                sendAdb("CNXN",0x01000000,4096,"host::\0".getBytes("UTF-8"));
+                Object[] hello=readAdb(deadline);
+                if(!hello[0].equals("CNXN"))throw new java.io.IOException("Expected CNXN");
+                System.out.println("MCU_IDENTITY "+new String((byte[])hello[3],"UTF-8"));
+                if(args[0].equals("adb-install-aod")||args[0].equals("adb-restore-aod"))guardedAodUpdate(args[0].equals("adb-restore-aod"));
+                if(args[0].equals("adb-list")) {
+                    String readCommand=args.length>1?args[1]:"ls /wf/";
+                    if(!Arrays.asList("help","pwd","ls /","ls /data/","ls /wf/","tail -n 80 /wf/wf_manager_config.txt").contains(readCommand))throw new IllegalArgumentException("Command outside read-only allowlist");
+                    java.io.ByteArrayOutputStream text=new java.io.ByteArrayOutputStream();
+                    sendAdb("OPEN",1,0,("shell:"+readCommand+"\0").getBytes("UTF-8"));
+                    while(true) {
+                        Object[] packet=readAdb(deadline);
+                        String command=(String)packet[0];int remote=(Integer)packet[1];
+                        if(command.equals("WRTE")) {
+                            text.write((byte[])packet[3]);
+                            sendAdb("OKAY",1,remote,new byte[0]);
+                        } else if(command.equals("CLSE")) {
+                            sendAdb("CLSE",1,remote,new byte[0]);break;
+                        }
+                    }
+                    System.out.println("MCU_OUTPUT_BASE64 "+android.util.Base64.encodeToString(text.toByteArray(),android.util.Base64.NO_WRAP));
+                    System.out.println("MCU_OUTPUT\n"+text.toString("UTF-8"));
+                }
+                if(args[0].equals("adb-pull")) {
+                    String path=args.length>1?args[1]:"/wf/wf_manager_config.txt";
+                    if(!path.equals("/wf/wf_manager_config.txt")&&!path.matches("/wf/wf[0-9]{1,2}/(setting\\.bin|aod/setting\\.bin|aod/script/main\\.js|aod/script/js_asset\\.js)"))throw new IllegalArgumentException("Path outside backup allowlist");
+                    sendAdb("OPEN",1,0,"sync:\0".getBytes("UTF-8"));
+                    int remote=0;
+                    Object[] opened=readAdb(deadline);
+                    if(!opened[0].equals("OKAY"))throw new java.io.IOException("Sync open failed");
+                    remote=(Integer)opened[1];
+                    byte[] pb=path.getBytes("UTF-8");
+                    ByteBuffer request=ByteBuffer.allocate(8+pb.length).order(ByteOrder.LITTLE_ENDIAN);
+                    request.put("RECV".getBytes("US-ASCII")).putInt(pb.length).put(pb);
+                    sendAdb("WRTE",1,remote,request.array());
+                    java.io.ByteArrayOutputStream sync=new java.io.ByteArrayOutputStream();
+                    java.io.ByteArrayOutputStream file=new java.io.ByteArrayOutputStream();
+                    int processed=0;boolean done=false;
+                    while(!done) {
+                        Object[] packet=readAdb(deadline);String command=(String)packet[0];
+                        if(command.equals("CLSE"))throw new java.io.IOException("Sync closed before DONE");
+                        if(!command.equals("WRTE"))continue;
+                        sync.write((byte[])packet[3]);sendAdb("OKAY",1,remote,new byte[0]);
+                        byte[] content=sync.toByteArray();
+                        while(processed+8<=content.length) {
+                            String tag=new String(content,processed,4,"US-ASCII");
+                            int len=ByteBuffer.wrap(content,processed+4,4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+                            if(len<0||len>1048576)throw new java.io.IOException("Invalid sync length");
+                            if(tag.equals("DONE")){done=true;break;}
+                            if(processed+8+len>content.length)break;
+                            if(tag.equals("FAIL"))throw new java.io.IOException("MCU read refused: "+new String(content,processed+8,len,"UTF-8"));
+                            if(!tag.equals("DATA"))throw new java.io.IOException("Unexpected sync tag "+tag);
+                            file.write(content,processed+8,len);processed+=8+len;
+                        }
+                    }
+                    sendAdb("CLSE",1,remote,new byte[0]);
+                    System.out.println("MCU_FILE_PATH "+path);
+                    System.out.println("MCU_FILE_SIZE "+file.size());
+                    System.out.println("MCU_FILE_BASE64 "+android.util.Base64.encodeToString(file.toByteArray(),android.util.Base64.NO_WRAP));
+                }
+            }
+        } finally {
+            call(connection,"destroy",new Class[]{});
+        }
+        System.out.println("Probe finished.");
+        System.exit(0);
+    }
+}

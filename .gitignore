@@ -1,0 +1,15 @@
+/local/
+/work/
+*.apk
+*.jar
+*.dex
+*.class
+*.bin
+*-response.txt
+native-aod-*.txt
+original-main.js
+candidate-main.js
+js_asset.js
+manifest.json
+__pycache__/
+/publication/notes-fr.txt
